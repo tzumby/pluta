@@ -1,6 +1,21 @@
 # Pluta
 
-**TODO: Add description**
+This implementation is for learning purposes and not complete.
+
+It uses `libcluster` in Gossip mode. Nodes will find each other as long as you name them:
+
+```
+iex --sname a -S mix
+```
+
+And in a different terminal / tab:
+
+```
+iex --sname b -S mix
+```
+
+etc..
+
 
 ## Installation
 
