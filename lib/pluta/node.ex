@@ -1,104 +1,155 @@
 defmodule Pluta.Node do
   use GenServer
 
+  alias Pluta.RPC
+
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  def init(_state) do
+  def init(_opts) do
     state = %{
-      type: "Follower",
-      term: 0,
+      current_term: 0,
+      voted_for: nil,
       election_timeout: random_timeout(),
-      heartbeat_timeout: random_timeout(),
-      votes: [],
-      voted: false,
-      heartbeat: true,
-      leader: nil
+      heartbeat: false,
+      leader_id: nil,
+      candidate_id: nil,
+      vote_count: 0,
+      me: Node.self()
     }
 
-    IO.inspect(
-      "Initializing with heartbeat: #{state.heartbeat_timeout}, election: #{
-        state.election_timeout
-      }"
-    )
-
-    loop_term(state)
-
-    {:ok, state}
+    {:ok, state, {:continue, :election}}
   end
 
-  def handle_info(:term, %{heartbeat: true} = state) do
-    IO.inspect("Term : #{inspect(state)}")
-    :timer.sleep(state.heartbeat_timeout)
-    loop_term(state)
+  def handle_continue(:election, %{election_timeout: election_timeout} = state) do
+    Process.send_after(self(), :term, election_timeout)
 
     {:noreply, state}
   end
 
-  def handle_info(:term, %{heartbeat: false, election_timeout: election_timeout} = state) do
-    Process.send_after(self(), :election, election_timeout)
-
-    {:noreply, state}
-  end
-
-  def handle_info(:election, %{leader: nil} = state) do
-    IO.inspect("[#{Node.self()}]: starting new election term. state: #{inspect(state)}")
+  def handle_info(:term, %{leader_id: nil, candidate_id: nil, heartbeat: false} = state) do
+    IO.puts("Starting election")
 
     state =
       state
-      |> update_in([:term], &(&1 + 1))
-      |> Map.put(:type, "Candidate")
+      |> update_in([:current_term], &(&1 + 1))
       |> Map.put(:election_timeout, random_timeout())
+      |> Map.put(:voted_for, Node.self())
+      |> Map.put(:candidate_id, Node.self())
 
-    Node.list()
-    |> Enum.each(fn node ->
-      IO.inspect(node, label: "sending vote request to")
-      :rpc.call(node, GenServer, :cast, [__MODULE__, {:vote_request, Node.self()}])
-    end)
+    RPC.vote_request(%{
+      term: state.current_term,
+      candidate_id: state.candidate_id
+    })
 
-    :timer.sleep(state.election_timeout)
-    loop_term(state)
+    Process.send_after(self(), :term, state.election_timeout)
 
     {:noreply, state}
   end
 
-  def handle_info(:election, state) do
-    Process.send(self(), :term, [])
+  def handle_info(
+        :term,
+        %{
+          me: me,
+          leader_id: leader_id,
+          election_timeout: election_timeout,
+          current_term: current_term,
+          candidate_id: candidate_id
+        } = state
+      )
+      when not is_nil(leader_id) and me == leader_id do
+    RPC.heartbeat(%{
+      term: current_term,
+      leader_id: Node.self(),
+      candidate_id: candidate_id
+    })
+
+    Process.send_after(self(), :term, election_timeout)
+
     {:noreply, state}
   end
 
-  def handle_cast({:vote_request, requesting_node}, %{leader: nil} = state) do
+  def handle_info(
+        :term,
+        %{heartbeat: true, leader_id: leader_id, election_timeout: election_timeout} = state
+      )
+      when not is_nil(leader_id) do
+    IO.puts("Normal term")
+
+    state = reset_heartbeat(state)
+
+    Process.send_after(self(), :term, election_timeout)
+
+    {:noreply, state}
+  end
+
+  def handle_info(
+        :term,
+        %{candidate_id: candidate_id, election_timeout: election_timeout, heartbeat: false} =
+          state
+      )
+      when not is_nil(candidate_id) do
+    IO.puts("Election timeout.")
+
     state =
-      update_in(state, [:term], &(&1 + 1))
-      |> Map.put(:voted, true)
+      reset_heartbeat(state)
+      |> Map.put(:candidate_id, nil)
+      |> Map.put(:leader_id, nil)
 
-    :rpc.call(requesting_node, GenServer, :cast, [__MODULE__, {:vote, Node.self()}])
+    Process.send_after(self(), :term, election_timeout)
 
     {:noreply, state}
   end
 
-  def handle_cast({:vote_request, _requesting_node}, state), do: {:noreply, state}
-
-  def handle_cast({:vote, vote_from}, %{leader: nil} = state) do
-    votes = state.votes ++ [vote_from]
-
-    state = Map.put(state, :votes, votes)
+  def handle_info(
+        :term,
+        %{candidate_id: nil, heartbeat: false, election_timeout: election_timeout} = state
+      ) do
+    IO.puts("Leader timeout")
 
     state =
-      if length(state.votes) >= 3 do
-        IO.inspect("Found leader: #{Node.self()}")
+      reset_heartbeat(state)
+      |> Map.put(:leader_id, nil)
 
+    Process.send_after(self(), :term, election_timeout)
+
+    {:noreply, state}
+  end
+
+  def handle_cast({:vote_request, %{term: term, candidate_id: candidate_id}}, state) do
+    state =
+      state
+      |> Map.put(:candidate_id, candidate_id)
+      |> Map.put(:voted_for, candidate_id)
+      |> Map.put(:current_term, term)
+
+    RPC.vote(%{candidate_id: state.candidate_id, term: state.current_term})
+
+    {:noreply, state}
+  end
+
+  def handle_cast(
+        {:vote, %{term: term}},
+        %{current_term: current_term, leader_id: nil} = state
+      )
+      when term >= current_term do
+    state =
+      state
+      |> update_in([:vote_count], &(&1 + 1))
+
+    state =
+      if state.vote_count >= 3 do
         state =
           state
-          |> Map.put(:type, "Leader")
-          |> Map.put(:leader, Node.self())
-          |> Map.put(:votes, [])
+          |> Map.put(:leader_id, Node.self())
+          |> Map.put(:candidate_id, nil)
 
-        Node.list()
-        |> Enum.each(fn node ->
-          :rpc.call(node, GenServer, :cast, [__MODULE__, {:elect_leader, state.leader}])
-        end)
+        RPC.heartbeat(%{
+          term: current_term,
+          leader_id: state.leader_id,
+          candidate_id: state.candidate_id
+        })
 
         state
       else
@@ -108,54 +159,31 @@ defmodule Pluta.Node do
     {:noreply, state}
   end
 
-  def handle_cast({:vote, vote_from}, state) do
-    {:noreply, state}
-  end
+  def handle_cast({:vote, _message}, state), do: {:noreply, state}
 
-  def handle_cast({:elect_leader, leader}, state) do
+  def handle_cast(
+        {:heartbeat, %{leader_id: leader_id, term: term, candidate_id: candidate_id}} = message,
+        state
+      ) do
+    IO.inspect("Receiving heartbeat")
+
     state =
       state
-      |> Map.put(:leader, leader)
-      |> Map.put(:type, "Follower")
+      |> Map.put(:leader_id, leader_id)
+      |> Map.put(:current_term, term)
+      |> Map.put(:heartbeat, true)
+      |> Map.put(:candidate_id, candidate_id)
 
     {:noreply, state}
   end
 
-  defp cluster_size do
-    length(Node.list())
-  end
-
-  defp loop_term(%{heartbeat_timeout: heartbeat_timeout, leader: leader})
-       when not is_nil(leader) do
-    Process.send_after(self(), :term, heartbeat_timeout)
-  end
-
-  defp loop_term(
-         %{
-           election_timeout: election_timeout,
-           heartbeat_timeout: heartbeat_timeout,
-           leader: nil,
-           votes: votes
-         } = state
-       )
-       when is_list(votes) and length(votes) > 0 do
-    if length(votes) >= ceil(cluster_size() / 2) do
-      state
-      |> Map.put(:type, "Leader")
-      |> Map.put(:leader, Node.self())
-
-      Process.send_after(self(), :term, heartbeat_timeout)
-    else
-      Process.send_after(self(), :election, election_timeout)
-    end
-  end
-
-  defp loop_term(%{election_timeout: election_timeout, leader: nil}) do
-    IO.inspect("[#{Node.self()}]: We have no leader, starting election in : #{election_timeout}")
-    Process.send_after(self(), :election, election_timeout)
-  end
+  def handle_cast({:heartbeat, _message}, state), do: {:noreply, state}
 
   defp random_timeout do
-    :rand.uniform(300_00)
+    :rand.uniform(3000_0)
+  end
+
+  defp reset_heartbeat(state) do
+    Map.put(state, :heartbeat, false)
   end
 end
