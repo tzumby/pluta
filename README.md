@@ -1,6 +1,6 @@
 # Pluta
 
-This implementation is for learning purposes and not complete.
+This implementation is for learning purposes and not complete. `pluta` is Romanian for raft.
 
 It uses `libcluster` in Gossip mode. Nodes will find each other as long as you name them:
 
