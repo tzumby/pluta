@@ -22,6 +22,14 @@ defmodule Pluta.Node do
     {:ok, state, {:continue, :election}}
   end
 
+  def current_term do
+    GenServer.call(__MODULE__, :current_term)
+  end
+
+  def leader do
+    GenServer.call(__MODULE__, :leader)
+  end
+
   def handle_continue(:election, %{election_timeout: election_timeout} = state) do
     Process.send_after(self(), :term, election_timeout)
 
@@ -29,19 +37,21 @@ defmodule Pluta.Node do
   end
 
   def handle_info(:term, %{leader_id: nil, candidate_id: nil, heartbeat: false} = state) do
-    IO.puts("Starting election")
+    if length(Node.list()) >= 2 do
+      IO.puts("Starting election")
 
-    state =
-      state
-      |> update_in([:current_term], &(&1 + 1))
-      |> Map.put(:election_timeout, random_timeout())
-      |> Map.put(:voted_for, Node.self())
-      |> Map.put(:candidate_id, Node.self())
+      state =
+        state
+        |> update_in([:current_term], &(&1 + 1))
+        |> Map.put(:election_timeout, random_timeout())
+        |> Map.put(:voted_for, Node.self())
+        |> Map.put(:candidate_id, Node.self())
 
-    RPC.vote_request(%{
-      term: state.current_term,
-      candidate_id: state.candidate_id
-    })
+      RPC.vote_request(%{
+        term: state.current_term,
+        candidate_id: state.candidate_id
+      })
+    end
 
     Process.send_after(self(), :term, state.election_timeout)
 
@@ -75,8 +85,6 @@ defmodule Pluta.Node do
         %{heartbeat: true, leader_id: leader_id, election_timeout: election_timeout} = state
       )
       when not is_nil(leader_id) do
-    IO.puts("Normal term")
-
     state = reset_heartbeat(state)
 
     Process.send_after(self(), :term, election_timeout)
@@ -140,6 +148,8 @@ defmodule Pluta.Node do
 
     state =
       if state.vote_count >= 3 do
+        IO.puts("Leader elected: #{Node.self()}")
+
         state =
           state
           |> Map.put(:leader_id, Node.self())
@@ -165,8 +175,6 @@ defmodule Pluta.Node do
         {:heartbeat, %{leader_id: leader_id, term: term, candidate_id: candidate_id}} = message,
         state
       ) do
-    IO.inspect("Receiving heartbeat")
-
     state =
       state
       |> Map.put(:leader_id, leader_id)
@@ -179,8 +187,16 @@ defmodule Pluta.Node do
 
   def handle_cast({:heartbeat, _message}, state), do: {:noreply, state}
 
+  def handle_call(:leader, _from, state) do
+    {:reply, Map.get(state, :leader_id), state}
+  end
+
+  def handle_call(:current_term, _from, state) do
+    {:reply, Map.get(state, :current_term), state}
+  end
+
   defp random_timeout do
-    :rand.uniform(3000_0)
+    :rand.uniform(150_0)
   end
 
   defp reset_heartbeat(state) do
